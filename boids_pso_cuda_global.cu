@@ -1,7 +1,14 @@
-// boids_pso_global.cu
-// Исправленная версия Boids-PSO: вместо дорогого поиска соседей по радиусу
-// используются глобальные средние положения и скорости роя.
-// Сложность O(N·dim) на итерацию вместо O(N²·dim).
+// boids_pso_cuda_optimized.cu
+// Оптимизированная версия Boids‑PSO с глобальными средними (O(N·dim)).
+// Главные оптимизации:
+// 1. Память переведена в раскладку SoA (dim × particles) — доступ к глобальной памяти
+//    становится коалесцированным во всех основных циклах.
+// 2. Средние по рою вычисляются полностью на GPU за один проход на каждое измерение,
+//    без копирования частичных сумм на хост.
+// 3. Убран расход разделяемой памяти O(blockDim * dim) в редукции средних;
+//    теперь используется стандартная редукция с O(blockDim) shared-памяти.
+// 4. Ядра обновления частиц максимально легковесны и не содержат больших локальных массивов.
+// 5. Добавлены проверки ошибок CUDA.
 
 #include <cuda_runtime.h>
 #include <curand.h>
@@ -13,32 +20,52 @@
 #include <cstring>
 #include <cmath>
 #include <unordered_map>
-#include <functional>
 #include <corecrt_math_defines.h>
 
 // ----------------------------------------------------------------------
-__device__ double rastrigin(const double* x, int dim) {
-    double s = 10.0 * dim;
-    for (int i = 0; i < dim; ++i)
-        s += x[i] * x[i] - 10.0 * cos(2.0 * M_PI * x[i]);
-    return s;
-}
+// Макрос для проверки ошибок CUDA
+// ----------------------------------------------------------------------
+#define CUDA_CHECK(call)                                            \
+    do {                                                            \
+        cudaError_t err = call;                                     \
+        if (err != cudaSuccess) {                                  \
+            std::cerr << "CUDA error at " << __FILE__ << ":"       \
+                      << __LINE__ << " - " << cudaGetErrorString(err) \
+                      << " (" << #call << ")" << std::endl;       \
+            exit(EXIT_FAILURE);                                    \
+        }                                                           \
+    } while (0)
 
-__device__ double rosenbrock(const double* x, int dim) {
-    double s = 0.0;
-    for (int i = 0; i < dim - 1; ++i) {
-        double t1 = x[i+1] - x[i]*x[i];
-        double t2 = 1.0 - x[i];
-        s += 100.0 * t1*t1 + t2*t2;
+// ----------------------------------------------------------------------
+// Целевые функции (double)
+// ----------------------------------------------------------------------
+__device__ double rastrigin(const double* x, int dim, int particles, int idx) {
+    double s = 10.0 * dim;
+    for (int j = 0; j < dim; ++j) {
+        double val = x[j * particles + idx];
+        s += val * val - 10.0 * cos(2.0 * M_PI * val);
     }
     return s;
 }
 
-__device__ double ackley(const double* x, int dim) {
+__device__ double rosenbrock(const double* x, int dim, int particles, int idx) {
+    double s = 0.0;
+    for (int j = 0; j < dim - 1; ++j) {
+        double xj = x[j * particles + idx];
+        double xj1 = x[(j + 1) * particles + idx];
+        double t1 = xj1 - xj * xj;
+        double t2 = 1.0 - xj;
+        s += 100.0 * t1 * t1 + t2 * t2;
+    }
+    return s;
+}
+
+__device__ double ackley(const double* x, int dim, int particles, int idx) {
     double sum1 = 0.0, sum2 = 0.0;
-    for (int i = 0; i < dim; ++i) {
-        sum1 += x[i] * x[i];
-        sum2 += cos(2.0 * M_PI * x[i]);
+    for (int j = 0; j < dim; ++j) {
+        double val = x[j * particles + idx];
+        sum1 += val * val;
+        sum2 += cos(2.0 * M_PI * val);
     }
     double inv = 1.0 / dim;
     return -20.0 * exp(-0.2 * sqrt(inv * sum1))
@@ -49,18 +76,21 @@ enum class FuncID { Rastrigin = 0, Rosenbrock, Ackley };
 FuncID get_func_id(const std::string& name) {
     if (name == "rosenbrock") return FuncID::Rosenbrock;
     if (name == "ackley") return FuncID::Ackley;
-    return FuncID::Rastrigin; // по умолчанию
+    return FuncID::Rastrigin;
 }
 
-__device__ double compute_fitness(const double* x, int dim, int func_id) {
+__device__ double compute_fitness(const double* x, int dim, int particles, int idx, int func_id) {
     switch (func_id) {
-        case 0: return rastrigin(x, dim);
-        case 1: return rosenbrock(x, dim);
-        case 2: return ackley(x, dim);
-        default: return rastrigin(x, dim);
+        case 0: return rastrigin(x, dim, particles, idx);
+        case 1: return rosenbrock(x, dim, particles, idx);
+        case 2: return ackley(x, dim, particles, idx);
+        default: return rastrigin(x, dim, particles, idx);
     }
 }
 
+// ----------------------------------------------------------------------
+// Границы по умолчанию
+// ----------------------------------------------------------------------
 struct Bounds { double lb, ub; };
 std::unordered_map<std::string, Bounds> func_bounds = {
     {"rastrigin", {-5.12, 5.12}},
@@ -69,29 +99,145 @@ std::unordered_map<std::string, Bounds> func_bounds = {
 };
 
 // ----------------------------------------------------------------------
-// Инициализация частиц (аналогично оригиналу)
+// Инициализация частиц (SoA‑раскладка)
 // ----------------------------------------------------------------------
 __global__ void init_kernel(double* X, double* V, double* pbest_pos, double* pbest_val,
-                            int dim, int particles, double lower, double upper, unsigned int seed, int func_id)
+                            int dim, int particles, double lower, double upper,
+                            unsigned int seed, int func_id)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= particles) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= particles) return;
+
     curandStatePhilox4_32_10_t state;
-    curand_init(seed, idx, 0, &state);
-    double* x = X + idx * dim;
-    double* v = V + idx * dim;
-    double* p = pbest_pos + idx * dim;
+    curand_init(seed, i, 0, &state);
     double range = upper - lower;
+
+    // Каждая нить инициализирует одну частицу, записывая все её измерения
     for (int j = 0; j < dim; ++j) {
-        x[j] = lower + curand_uniform_double(&state) * range;
-        v[j] = curand_uniform_double(&state) * 2.0 - 1.0;
-        p[j] = x[j];
+        double x_val = lower + curand_uniform_double(&state) * range;
+        double v_val = curand_uniform_double(&state) * 2.0 - 1.0;
+        X[j * particles + i] = x_val;
+        V[j * particles + i] = v_val;
+        pbest_pos[j * particles + i] = x_val;
     }
-    pbest_val[idx] = compute_fitness(x, dim, func_id);
+    pbest_val[i] = compute_fitness(X, dim, particles, i, func_id);
 }
 
 // ----------------------------------------------------------------------
-// Редукция для поиска глобального минимума (блок → массив)
+// Параллельная редукция сумм для всех частиц вдоль одного измерения.
+// Запускается с dim блоками, каждый обрабатывает своё измерение.
+// Вычисляет одновременно сумму X и сумму V и записывает средние в mean_X, mean_V.
+// ----------------------------------------------------------------------
+__global__ void reduce_mean_per_dim(const double* X, const double* V,
+                                    int dim, int particles,
+                                    double* mean_X, double* mean_V)
+{
+    int j = blockIdx.x;               // номер измерения
+    if (j >= dim) return;
+
+    const double* x_ptr = X + j * particles;
+    const double* v_ptr = V + j * particles;
+    double sum_x = 0.0, sum_v = 0.0;
+
+    // Каждая нить суммирует свою часть элементов
+    for (int i = threadIdx.x; i < particles; i += blockDim.x) {
+        sum_x += x_ptr[i];
+        sum_v += v_ptr[i];
+    }
+
+    // Редукция внутри блока
+    extern __shared__ double shared[];
+    double* s_x = shared;
+    double* s_v = shared + blockDim.x;
+    s_x[threadIdx.x] = sum_x;
+    s_v[threadIdx.x] = sum_v;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_x[threadIdx.x] += s_x[threadIdx.x + s];
+            s_v[threadIdx.x] += s_v[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        mean_X[j] = s_x[0] / particles;
+        mean_V[j] = s_v[0] / particles;
+    }
+}
+
+// ----------------------------------------------------------------------
+// Обновление частиц с использованием глобальных средних (Boids + PSO)
+// ----------------------------------------------------------------------
+__global__ void update_particles_global(double* X, double* V,
+                                        double* pbest_pos, double* pbest_val,
+                                        int dim, int particles,
+                                        const double* __restrict__ gbest_pos,
+                                        const double* __restrict__ mean_X,
+                                        const double* __restrict__ mean_V,
+                                        double lower, double upper,
+                                        double w, double c1, double c2,
+                                        double beta, double gamma,
+                                        unsigned int seed, int func_id)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= particles) return;
+
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, i, 0, &state);
+
+    double range = upper - lower;
+    double max_vel_coeff = 0.2;
+
+    for (int j = 0; j < dim; ++j) {
+        // Загрузка координат (коалесцированный доступ: соседние нити читают соседние элементы)
+        double x_ij = X[j * particles + i];
+        double v_ij = V[j * particles + i];
+        double p_ij = pbest_pos[j * particles + i];
+
+        // Глобальные средние и лучший
+        double mean_X_j = mean_X[j];
+        double mean_V_j = mean_V[j];
+        double gbest_j  = gbest_pos[j];
+
+        // Boids‑компоненты (разделение (separation) отключено, оставлены alignment и cohesion)
+        double alignment = mean_V_j - v_ij;
+        double cohesion  = mean_X_j - x_ij;
+
+        double r1 = curand_uniform_double(&state);
+        double r2 = curand_uniform_double(&state);
+
+        v_ij = w * v_ij
+             + c1 * r1 * (p_ij - x_ij)
+             + c2 * r2 * (gbest_j - x_ij)
+             + beta  * alignment
+             + gamma * cohesion;
+
+        // Ограничение скорости
+        double max_vel = max_vel_coeff * range;
+        v_ij = fmin(fmax(v_ij, -max_vel), max_vel);
+
+        // Обновление позиции с отражением от границ
+        double new_x = x_ij + v_ij;
+        if (new_x < lower) { new_x = lower; v_ij = 0.0; }
+        if (new_x > upper) { new_x = upper; v_ij = 0.0; }
+
+        X[j * particles + i] = new_x;
+        V[j * particles + i] = v_ij;
+    }
+
+    // Обновление персонального лучшего
+    double new_val = compute_fitness(X, dim, particles, i, func_id);
+    if (new_val < pbest_val[i]) {
+        pbest_val[i] = new_val;
+        for (int j = 0; j < dim; ++j)
+            pbest_pos[j * particles + i] = X[j * particles + i];
+    }
+}
+
+// ----------------------------------------------------------------------
+// Редукция минимума в блоке (для поиска глобального лучшего)
 // ----------------------------------------------------------------------
 __global__ void block_reduce_min(const double* pbest_val, int particles,
                                  double* d_block_vals, int* d_block_idxs)
@@ -105,6 +251,7 @@ __global__ void block_reduce_min(const double* pbest_val, int particles,
     s_vals[tid] = val;
     s_idxs[tid] = idx;
     __syncthreads();
+
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             if (s_vals[tid + s] < s_vals[tid] ||
@@ -122,115 +269,7 @@ __global__ void block_reduce_min(const double* pbest_val, int particles,
 }
 
 // ----------------------------------------------------------------------
-// Редукция векторов X и V для вычисления средних по рою
-// Каждый блок суммирует свои частицы, результат записывается в два блочных массива
-// Размер shared memory: 2 * blockDim.x * dim * sizeof(double)
-// ----------------------------------------------------------------------
-__global__ void reduce_vectors(const double* X, const double* V,
-                               int dim, int particles,
-                               double* d_block_Xsums, double* d_block_Vsums)
-{
-    extern __shared__ double s[];
-    // Раскладка: первые blockDim.x * dim ячеек — для X, затем blockDim.x * dim — для V
-    int tid = threadIdx.x;
-    int block_stride = blockDim.x * dim;
-    double* s_X = s;
-    double* s_V = s + block_stride;
-
-    // Загрузка частиц блока в shared память
-    int idx = blockIdx.x * blockDim.x + tid;
-    if (idx < particles) {
-        for (int d = 0; d < dim; ++d) {
-            s_X[tid * dim + d] = X[idx * dim + d];
-            s_V[tid * dim + d] = V[idx * dim + d];
-        }
-    } else {
-        // Выходящие за границы нити зануляют свои элементы
-        for (int d = 0; d < dim; ++d) {
-            s_X[tid * dim + d] = 0.0;
-            s_V[tid * dim + d] = 0.0;
-        }
-    }
-    __syncthreads();
-
-    // Парная редукция внутри блока
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            for (int d = 0; d < dim; ++d) {
-                s_X[tid * dim + d] += s_X[(tid + s) * dim + d];
-                s_V[tid * dim + d] += s_V[(tid + s) * dim + d];
-            }
-        }
-        __syncthreads();
-    }
-
-    // Запись результатов блока
-    if (tid == 0) {
-        for (int d = 0; d < dim; ++d) {
-            d_block_Xsums[blockIdx.x * dim + d] = s_X[d];
-            d_block_Vsums[blockIdx.x * dim + d] = s_V[d];
-        }
-    }
-}
-
-// ----------------------------------------------------------------------
-// Ядро обновления частиц с глобальными средними (вместо локальных соседей)
-// ----------------------------------------------------------------------
-__global__ void update_particles_global(double* X, double* V,
-                                        double* pbest_pos, double* pbest_val,
-                                        int dim, int particles,
-                                        const double* __restrict__ gbest_pos,
-                                        const double* __restrict__ mean_X,
-                                        const double* __restrict__ mean_V,
-                                        double lower, double upper,
-                                        double w, double c1, double c2,
-                                        double alpha, double beta, double gamma,
-                                        unsigned int seed, int func_id)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particles) return;
-
-    curandStatePhilox4_32_10_t state;
-    curand_init(seed, i, 0, &state);
-    double* x_i = X + i * dim;
-    double* v_i = V + i * dim;
-    double* p_i = pbest_pos + i * dim;
-
-    double max_vel_coeff = 0.2;
-    double range = upper - lower;
-
-    for (int j = 0; j < dim; ++j) {
-        // Boids-компоненты от глобальных средних
-        //double separation   = x_i[j] - mean_X[j];   // от центра масс
-        double alignment    = mean_V[j] - v_i[j];   // к средней скорости
-        double cohesion     = mean_X[j] - x_i[j];   // к центру масс
-
-        double r1 = curand_uniform_double(&state);
-        double r2 = curand_uniform_double(&state);
-        v_i[j] = w * v_i[j]
-               + c1 * r1 * (p_i[j] - x_i[j])
-               + c2 * r2 * (gbest_pos[j] - x_i[j])
-               //+ alpha * separation
-               + beta  * alignment
-               + gamma * cohesion;
-
-        double max_vel = max_vel_coeff * range;
-        v_i[j] = fmin(fmax(v_i[j], -max_vel), max_vel);
-        x_i[j] += v_i[j];
-        if (x_i[j] < lower) { x_i[j] = lower; v_i[j] = 0.0; }
-        if (x_i[j] > upper) { x_i[j] = upper; v_i[j] = 0.0; }
-    }
-
-    double new_val = compute_fitness(x_i, dim, func_id);
-    if (new_val < pbest_val[i]) {
-        pbest_val[i] = new_val;
-        for (int j = 0; j < dim; ++j)
-            p_i[j] = x_i[j];
-    }
-}
-
-// ----------------------------------------------------------------------
-// Вспомогательная функция поиска и обновления глобального лучшего
+// Поиск и обновление глобального лучшего (частично на хосте)
 // ----------------------------------------------------------------------
 void find_and_update_global_best(const double* d_pbest_val, const double* d_X,
                                  double* d_gbest_val, double* d_gbest_pos,
@@ -239,81 +278,87 @@ void find_and_update_global_best(const double* d_pbest_val, const double* d_X,
                                  int grid_size, int block_size,
                                  double& host_gbest_val, std::vector<double>& host_gbest_pos)
 {
+    // Редукция по блокам
     block_reduce_min<<<grid_size, block_size, 2 * block_size * sizeof(double)>>>(
         d_pbest_val, particles, d_block_vals, d_block_idxs);
 
     std::vector<double> block_vals(grid_size);
     std::vector<int> block_idxs(grid_size);
-    cudaMemcpy(block_vals.data(), d_block_vals, grid_size * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(block_idxs.data(), d_block_idxs, grid_size * sizeof(int), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(block_vals.data(), d_block_vals, grid_size * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(block_idxs.data(), d_block_idxs, grid_size * sizeof(int), cudaMemcpyDeviceToHost));
 
     double min_val = block_vals[0];
     int best_idx = block_idxs[0];
-    for (int i = 1; i < grid_size; ++i) {
-        if (block_vals[i] < min_val) {
-            min_val = block_vals[i];
-            best_idx = block_idxs[i];
+    for (int b = 1; b < grid_size; ++b) {
+        if (block_vals[b] < min_val) {
+            min_val = block_vals[b];
+            best_idx = block_idxs[b];
         }
     }
 
     if (min_val < host_gbest_val) {
         host_gbest_val = min_val;
-        cudaMemcpy(host_gbest_pos.data(), d_X + best_idx * dim, dim * sizeof(double), cudaMemcpyDeviceToHost);
+        // В SoA‑раскладке позиция лучшей частицы разбросана по измерениям:
+        //   координата j хранится в d_X[j * particles + best_idx]
+        // Копируем её на хост (можно было бы оставить на устройстве, но для единообразия копируем)
+        std::vector<double> temp_pos(dim);
+        for (int j = 0; j < dim; ++j) {
+            CUDA_CHECK(cudaMemcpy(&temp_pos[j],
+                                  d_X + j * particles + best_idx,
+                                  sizeof(double), cudaMemcpyDeviceToHost));
+        }
+        host_gbest_pos = temp_pos;
     }
-    cudaMemcpy(d_gbest_val, &host_gbest_val, sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
+
+    CUDA_CHECK(cudaMemcpy(d_gbest_val, &host_gbest_val, sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
 }
 
 // ----------------------------------------------------------------------
-// Основная процедура Boids-PSO с глобальными средними
+// Основная процедура Boids‑PSO (глобальные средние, SoA‑раскладка)
 // ----------------------------------------------------------------------
-void boids_pso_global(int dim, int particles, int iterations,
-                      double w, double c1, double c2,
-                      double alpha, double beta, double gamma,
-                      double lower, double upper,
-                      std::vector<double>& best_pos, double& best_val,
-                      std::vector<double>& history, unsigned int seed,
-                      const std::string& func_name)
+void boids_pso_optimized(int dim, int particles, int iterations,
+                         double w, double c1, double c2,
+                         double beta, double gamma,
+                         double lower, double upper,
+                         std::vector<double>& best_pos, double& best_val,
+                         std::vector<double>& history, unsigned int seed,
+                         const std::string& func_name)
 {
-    // Основные массивы
+    // ---------- Выделение памяти ----------
+    // Все векторы частиц хранятся как [dim][particles]
     double *d_X, *d_V, *d_pbest_pos, *d_pbest_val;
-    double *d_gbest_pos, *d_gbest_val;
-    cudaMalloc(&d_X, particles * dim * sizeof(double));
-    cudaMalloc(&d_V, particles * dim * sizeof(double));
-    cudaMalloc(&d_pbest_pos, particles * dim * sizeof(double));
-    cudaMalloc(&d_pbest_val, particles * sizeof(double));
-    cudaMalloc(&d_gbest_pos, dim * sizeof(double));
-    cudaMalloc(&d_gbest_val, sizeof(double));
+    CUDA_CHECK(cudaMalloc(&d_X, dim * particles * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_V, dim * particles * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_pbest_pos, dim * particles * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_pbest_val, particles * sizeof(double)));
 
-    // Блоковые массивы для редукции (минимум)
+    double *d_gbest_pos, *d_gbest_val;
+    CUDA_CHECK(cudaMalloc(&d_gbest_pos, dim * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_gbest_val, sizeof(double)));
+
+    // Средние на устройстве
+    double *d_mean_X, *d_mean_V;
+    CUDA_CHECK(cudaMalloc(&d_mean_X, dim * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_mean_V, dim * sizeof(double)));
+
+    // Временные массивы для редукции минимума
     int block_size_min = 256;
     int grid_size_min = (particles + block_size_min - 1) / block_size_min;
-    double *d_block_vals; int *d_block_idxs;
-    cudaMalloc(&d_block_vals, grid_size_min * sizeof(double));
-    cudaMalloc(&d_block_idxs, grid_size_min * sizeof(int));
-
-    // Для вычисления средних: меньший размер блока, чтобы уместиться в shared memory
-    int block_size_mean = 128;
-    int grid_size_mean = (particles + block_size_mean - 1) / block_size_mean;
-    // Память для блочных сумм (X и V)
-    double *d_block_Xsums, *d_block_Vsums;
-    cudaMalloc(&d_block_Xsums, grid_size_mean * dim * sizeof(double));
-    cudaMalloc(&d_block_Vsums, grid_size_mean * dim * sizeof(double));
-
-    // Буферы для глобальных средних на устройстве
-    double *d_mean_X, *d_mean_V;
-    cudaMalloc(&d_mean_X, dim * sizeof(double));
-    cudaMalloc(&d_mean_V, dim * sizeof(double));
+    double *d_block_vals;
+    int *d_block_idxs;
+    CUDA_CHECK(cudaMalloc(&d_block_vals, grid_size_min * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_block_idxs, grid_size_min * sizeof(int)));
 
     int func_id = static_cast<int>(get_func_id(func_name));
 
-    // Инициализация
+    // ---------- Инициализация ----------
     init_kernel<<<grid_size_min, block_size_min>>>(
         d_X, d_V, d_pbest_pos, d_pbest_val,
         dim, particles, lower, upper, seed, func_id);
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Первичный глобальный лучший
+    // Первичный выбор глобального лучшего
     double host_gbest_val = INFINITY;
     std::vector<double> host_gbest_pos(dim);
     find_and_update_global_best(d_pbest_val, d_X,
@@ -323,45 +368,28 @@ void boids_pso_global(int dim, int particles, int iterations,
                                 grid_size_min, block_size_min,
                                 host_gbest_val, host_gbest_pos);
 
-    // Главный цикл
+    // Параметры запуска для редукции средних (один блок на измерение)
+    int block_size_mean = 256;   // можно увеличить до 512/1024 при наличии ресурсов
+    // shared memory: 2 * block_size_mean * sizeof(double)
+    int shared_mem_mean = 2 * block_size_mean * sizeof(double);
+
+    // ---------- Главный цикл ----------
     for (int t = 0; t < iterations; ++t) {
-        // 1. Вычисление глобальных средних X и V
-        reduce_vectors<<<grid_size_mean, block_size_mean,
-                         2 * block_size_mean * dim * sizeof(double)>>>(
-            d_X, d_V, dim, particles, d_block_Xsums, d_block_Vsums);
-        // Копируем блочные суммы на хост и вычисляем средние
-        std::vector<double> h_block_Xsums(grid_size_mean * dim);
-        std::vector<double> h_block_Vsums(grid_size_mean * dim);
-        cudaMemcpy(h_block_Xsums.data(), d_block_Xsums,
-                   grid_size_mean * dim * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_block_Vsums.data(), d_block_Vsums,
-                   grid_size_mean * dim * sizeof(double), cudaMemcpyDeviceToHost);
+        // 1. Вычисление глобальных средних X и V полностью на GPU
+        reduce_mean_per_dim<<<dim, block_size_mean, shared_mem_mean>>>(
+            d_X, d_V, dim, particles, d_mean_X, d_mean_V);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-        std::vector<double> mean_X(dim, 0.0), mean_V(dim, 0.0);
-        for (int b = 0; b < grid_size_mean; ++b) {
-            for (int d = 0; d < dim; ++d) {
-                mean_X[d] += h_block_Xsums[b * dim + d];
-                mean_V[d] += h_block_Vsums[b * dim + d];
-            }
-        }
-        for (int d = 0; d < dim; ++d) {
-            mean_X[d] /= particles;
-            mean_V[d] /= particles;
-        }
-        // Копируем средние на устройство
-        cudaMemcpy(d_mean_X, mean_X.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_mean_V, mean_V.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
-
-        // 2. Обновление частиц (с использованием глобальных средних)
+        // 2. Обновление частиц
         update_particles_global<<<grid_size_min, block_size_min>>>(
             d_X, d_V, d_pbest_pos, d_pbest_val,
             dim, particles, d_gbest_pos,
             d_mean_X, d_mean_V,
             lower, upper, w, c1, c2,
-            alpha, beta, gamma, seed + t + 1, func_id);
-        cudaDeviceSynchronize();
+            beta, gamma, seed + t + 1, func_id);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-        // 3. Поиск и обновление глобального лучшего
+        // 3. Поиск нового глобального лучшего
         find_and_update_global_best(d_pbest_val, d_X,
                                     d_gbest_val, d_gbest_pos,
                                     dim, particles,
@@ -375,32 +403,32 @@ void boids_pso_global(int dim, int particles, int iterations,
     best_val = host_gbest_val;
     best_pos = host_gbest_pos;
 
-    // Очистка памяти
-    cudaFree(d_X); cudaFree(d_V); cudaFree(d_pbest_pos); cudaFree(d_pbest_val);
-    cudaFree(d_gbest_pos); cudaFree(d_gbest_val);
-    cudaFree(d_block_vals); cudaFree(d_block_idxs);
-    cudaFree(d_block_Xsums); cudaFree(d_block_Vsums);
-    cudaFree(d_mean_X); cudaFree(d_mean_V);
+    // ---------- Очистка ----------
+    CUDA_CHECK(cudaFree(d_X)); CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_pbest_pos)); CUDA_CHECK(cudaFree(d_pbest_val));
+    CUDA_CHECK(cudaFree(d_gbest_pos)); CUDA_CHECK(cudaFree(d_gbest_val));
+    CUDA_CHECK(cudaFree(d_mean_X)); CUDA_CHECK(cudaFree(d_mean_V));
+    CUDA_CHECK(cudaFree(d_block_vals)); CUDA_CHECK(cudaFree(d_block_idxs));
 }
 
+// ----------------------------------------------------------------------
+// main
 // ----------------------------------------------------------------------
 int main(int argc, char** argv) {
     int dim = 30, particles = 500, iterations = 500, file = 0;
     double w = 0.7, c1 = 1.5, c2 = 1.5;
-    double alpha = 0.02, beta = 0.01, gamma = 0.01;
+    double beta = 0.01, gamma = 0.01;
     unsigned int seed = 42;
     std::string func = "rastrigin";
     double lb = INFINITY, ub = INFINITY;
 
-    // Параметр r_neigh больше не нужен, но оставим для совместимости
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-dim") == 0 && i+1 < argc) dim = atoi(argv[++i]);
         else if (strcmp(argv[i], "-particles") == 0 && i+1 < argc) particles = atoi(argv[++i]);
         else if (strcmp(argv[i], "-iter") == 0 && i+1 < argc) iterations = atoi(argv[++i]);
         else if (strcmp(argv[i], "-w") == 0 && i+1 < argc) w = atof(argv[++i]);
         else if (strcmp(argv[i], "-c1") == 0 && i+1 < argc) c1 = atof(argv[++i]);
         else if (strcmp(argv[i], "-c2") == 0 && i+1 < argc) c2 = atof(argv[++i]);
-        //else if (strcmp(argv[i], "-alpha") == 0 && i+1 < argc) alpha = atof(argv[++i]);
         else if (strcmp(argv[i], "-beta") == 0 && i+1 < argc) beta = atof(argv[++i]);
         else if (strcmp(argv[i], "-gamma") == 0 && i+1 < argc) gamma = atof(argv[++i]);
         else if (strcmp(argv[i], "-seed") == 0 && i+1 < argc) seed = atoi(argv[++i]);
@@ -408,12 +436,11 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-lb") == 0 && i+1 < argc) lb = atof(argv[++i]);
         else if (strcmp(argv[i], "-ub") == 0 && i+1 < argc) ub = atof(argv[++i]);
         else if (strcmp(argv[i], "-file") == 0 && i+1 < argc) file = atoi(argv[++i]);
-        // -r_neigh игнорируется
     }
     if (lb == INFINITY) lb = func_bounds[func].lb;
     if (ub == INFINITY) ub = func_bounds[func].ub;
 
-    std::cout << "Boids-PSO with global means (dim=" << dim
+    std::cout << "Optimized Boids-PSO (SoA, dim=" << dim
               << ", particles=" << particles << ", iter=" << iterations << ")\n";
 
     std::vector<double> best_pos(dim);
@@ -421,18 +448,19 @@ int main(int argc, char** argv) {
     std::vector<double> history(iterations);
 
     auto start = std::chrono::high_resolution_clock::now();
-    boids_pso_global(dim, particles, iterations, w, c1, c2,
-                     alpha, beta, gamma, lb, ub,
-                     best_pos, best_val, history, seed, func);
+    boids_pso_optimized(dim, particles, iterations, w, c1, c2,
+                        beta, gamma, lb, ub,
+                        best_pos, best_val, history, seed, func);
     auto end = std::chrono::high_resolution_clock::now();
 
     double time_sec = std::chrono::duration<double>(end - start).count();
     std::cout << "CUDA_TIME: " << time_sec << std::endl;
     std::cout << "BEST_VALUE: " << best_val << std::endl;
 
-    if (file != 0){
+    if (file != 0) {
         char fname[256];
-        snprintf(fname, sizeof(fname), "boids_pso_global_%s_d%d_p%d_i%d_w%.2f_b%.4f_g%.4f_seed%u.txt",
+        snprintf(fname, sizeof(fname),
+                 "boids_pso_optimized_%s_d%d_p%d_i%d_w%.2f_b%.4f_g%.4f_seed%u.txt",
                  func.c_str(), dim, particles, iterations, w, beta, gamma, seed);
         std::ofstream f(fname);
         f << "iteration,best_value\n";
@@ -444,4 +472,5 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-//компиляция nvcc -O2 boids_pso_cuda_global.cu -o boids_pso_cuda_global.exe -lcurand
+// Компиляция:
+// nvcc -O2 boids_pso_cuda_global.cu -o boids_pso_cuda_global.exe -lcurand
