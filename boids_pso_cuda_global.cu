@@ -1,14 +1,11 @@
-// boids_pso_cuda_optimized.cu
+// boids_pso_cuda_global_optimized.cu
 // Оптимизированная версия Boids‑PSO с глобальными средними (O(N·dim)).
-// Главные оптимизации:
-// 1. Память переведена в раскладку SoA (dim × particles) — доступ к глобальной памяти
-//    становится коалесцированным во всех основных циклах.
-// 2. Средние по рою вычисляются полностью на GPU за один проход на каждое измерение,
-//    без копирования частичных сумм на хост.
-// 3. Убран расход разделяемой памяти O(blockDim * dim) в редукции средних;
-//    теперь используется стандартная редукция с O(blockDim) shared-памяти.
-// 4. Ядра обновления частиц максимально легковесны и не содержат больших локальных массивов.
-// 5. Добавлены проверки ошибок CUDA.
+// Оптимизации:
+// 1. SoA‑раскладка.
+// 2. Средние вычисляются полностью на GPU, без копирования на хост.
+// 3. d_gbest_val устранено, gbest_pos копируется только при улучшении.
+// 4. Кэширование gbest_pos и mean_X, mean_V в shared-память в ядре обновления (где возможно).
+// 5. Убран <corecrt_math_defines.h>, константы определены.
 
 #include <cuda_runtime.h>
 #include <curand.h>
@@ -20,11 +17,14 @@
 #include <cstring>
 #include <cmath>
 #include <unordered_map>
-#include <corecrt_math_defines.h>
 
-// ----------------------------------------------------------------------
-// Макрос для проверки ошибок CUDA
-// ----------------------------------------------------------------------
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
+
 #define CUDA_CHECK(call)                                            \
     do {                                                            \
         cudaError_t err = call;                                     \
@@ -36,9 +36,7 @@
         }                                                           \
     } while (0)
 
-// ----------------------------------------------------------------------
-// Целевые функции (double)
-// ----------------------------------------------------------------------
+// Целевые функции
 __device__ double rastrigin(const double* x, int dim, int particles, int idx) {
     double s = 10.0 * dim;
     for (int j = 0; j < dim; ++j) {
@@ -47,7 +45,6 @@ __device__ double rastrigin(const double* x, int dim, int particles, int idx) {
     }
     return s;
 }
-
 __device__ double rosenbrock(const double* x, int dim, int particles, int idx) {
     double s = 0.0;
     for (int j = 0; j < dim - 1; ++j) {
@@ -59,7 +56,6 @@ __device__ double rosenbrock(const double* x, int dim, int particles, int idx) {
     }
     return s;
 }
-
 __device__ double ackley(const double* x, int dim, int particles, int idx) {
     double sum1 = 0.0, sum2 = 0.0;
     for (int j = 0; j < dim; ++j) {
@@ -88,9 +84,6 @@ __device__ double compute_fitness(const double* x, int dim, int particles, int i
     }
 }
 
-// ----------------------------------------------------------------------
-// Границы по умолчанию
-// ----------------------------------------------------------------------
 struct Bounds { double lb, ub; };
 std::unordered_map<std::string, Bounds> func_bounds = {
     {"rastrigin", {-5.12, 5.12}},
@@ -99,7 +92,7 @@ std::unordered_map<std::string, Bounds> func_bounds = {
 };
 
 // ----------------------------------------------------------------------
-// Инициализация частиц (SoA‑раскладка)
+// Инициализация (SoA)
 // ----------------------------------------------------------------------
 __global__ void init_kernel(double* X, double* V, double* pbest_pos, double* pbest_val,
                             int dim, int particles, double lower, double upper,
@@ -107,12 +100,9 @@ __global__ void init_kernel(double* X, double* V, double* pbest_pos, double* pbe
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particles) return;
-
     curandStatePhilox4_32_10_t state;
     curand_init(seed, i, 0, &state);
     double range = upper - lower;
-
-    // Каждая нить инициализирует одну частицу, записывая все её измерения
     for (int j = 0; j < dim; ++j) {
         double x_val = lower + curand_uniform_double(&state) * range;
         double v_val = curand_uniform_double(&state) * 2.0 - 1.0;
@@ -124,35 +114,27 @@ __global__ void init_kernel(double* X, double* V, double* pbest_pos, double* pbe
 }
 
 // ----------------------------------------------------------------------
-// Параллельная редукция сумм для всех частиц вдоль одного измерения.
-// Запускается с dim блоками, каждый обрабатывает своё измерение.
-// Вычисляет одновременно сумму X и сумму V и записывает средние в mean_X, mean_V.
+// Параллельная редукция сумм для средних X и V по измерениям
 // ----------------------------------------------------------------------
 __global__ void reduce_mean_per_dim(const double* X, const double* V,
                                     int dim, int particles,
                                     double* mean_X, double* mean_V)
 {
-    int j = blockIdx.x;               // номер измерения
+    int j = blockIdx.x;
     if (j >= dim) return;
-
     const double* x_ptr = X + j * particles;
     const double* v_ptr = V + j * particles;
     double sum_x = 0.0, sum_v = 0.0;
-
-    // Каждая нить суммирует свою часть элементов
     for (int i = threadIdx.x; i < particles; i += blockDim.x) {
         sum_x += x_ptr[i];
         sum_v += v_ptr[i];
     }
-
-    // Редукция внутри блока
     extern __shared__ double shared[];
     double* s_x = shared;
     double* s_v = shared + blockDim.x;
     s_x[threadIdx.x] = sum_x;
     s_v[threadIdx.x] = sum_v;
     __syncthreads();
-
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
             s_x[threadIdx.x] += s_x[threadIdx.x + s];
@@ -160,7 +142,6 @@ __global__ void reduce_mean_per_dim(const double* X, const double* V,
         }
         __syncthreads();
     }
-
     if (threadIdx.x == 0) {
         mean_X[j] = s_x[0] / particles;
         mean_V[j] = s_v[0] / particles;
@@ -168,7 +149,7 @@ __global__ void reduce_mean_per_dim(const double* X, const double* V,
 }
 
 // ----------------------------------------------------------------------
-// Обновление частиц с использованием глобальных средних (Boids + PSO)
+// Обновление частиц с использованием глобальных средних (с кэшированием gbest/mean)
 // ----------------------------------------------------------------------
 __global__ void update_particles_global(double* X, double* V,
                                         double* pbest_pos, double* pbest_val,
@@ -184,24 +165,32 @@ __global__ void update_particles_global(double* X, double* V,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particles) return;
 
+    // Кэширование gbest и средних в разделяемую память (если dim не слишком велик)
+    extern __shared__ double s_data[]; // [dim * 3] для gbest, mean_X, mean_V
+    double* s_gbest = s_data;
+    double* s_meanX = s_data + dim;
+    double* s_meanV = s_data + 2 * dim;
+    for (int t = threadIdx.x; t < dim; t += blockDim.x) {
+        s_gbest[t] = gbest_pos[t];
+        s_meanX[t] = mean_X[t];
+        s_meanV[t] = mean_V[t];
+    }
+    __syncthreads();
+
     curandStatePhilox4_32_10_t state;
     curand_init(seed, i, 0, &state);
-
     double range = upper - lower;
     double max_vel_coeff = 0.2;
 
     for (int j = 0; j < dim; ++j) {
-        // Загрузка координат (коалесцированный доступ: соседние нити читают соседние элементы)
         double x_ij = X[j * particles + i];
         double v_ij = V[j * particles + i];
         double p_ij = pbest_pos[j * particles + i];
 
-        // Глобальные средние и лучший
-        double mean_X_j = mean_X[j];
-        double mean_V_j = mean_V[j];
-        double gbest_j  = gbest_pos[j];
+        double mean_X_j = s_meanX[j];
+        double mean_V_j = s_meanV[j];
+        double gbest_j  = s_gbest[j];
 
-        // Boids‑компоненты (разделение (separation) отключено, оставлены alignment и cohesion)
         double alignment = mean_V_j - v_ij;
         double cohesion  = mean_X_j - x_ij;
 
@@ -214,11 +203,9 @@ __global__ void update_particles_global(double* X, double* V,
              + beta  * alignment
              + gamma * cohesion;
 
-        // Ограничение скорости
         double max_vel = max_vel_coeff * range;
         v_ij = fmin(fmax(v_ij, -max_vel), max_vel);
 
-        // Обновление позиции с отражением от границ
         double new_x = x_ij + v_ij;
         if (new_x < lower) { new_x = lower; v_ij = 0.0; }
         if (new_x > upper) { new_x = upper; v_ij = 0.0; }
@@ -227,7 +214,6 @@ __global__ void update_particles_global(double* X, double* V,
         V[j * particles + i] = v_ij;
     }
 
-    // Обновление персонального лучшего
     double new_val = compute_fitness(X, dim, particles, i, func_id);
     if (new_val < pbest_val[i]) {
         pbest_val[i] = new_val;
@@ -237,7 +223,7 @@ __global__ void update_particles_global(double* X, double* V,
 }
 
 // ----------------------------------------------------------------------
-// Редукция минимума в блоке (для поиска глобального лучшего)
+// Редукция минимума в блоке
 // ----------------------------------------------------------------------
 __global__ void block_reduce_min(const double* pbest_val, int particles,
                                  double* d_block_vals, int* d_block_idxs)
@@ -251,7 +237,6 @@ __global__ void block_reduce_min(const double* pbest_val, int particles,
     s_vals[tid] = val;
     s_idxs[tid] = idx;
     __syncthreads();
-
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             if (s_vals[tid + s] < s_vals[tid] ||
@@ -269,19 +254,17 @@ __global__ void block_reduce_min(const double* pbest_val, int particles,
 }
 
 // ----------------------------------------------------------------------
-// Поиск и обновление глобального лучшего (частично на хосте)
+// Поиск и обновление глобального лучшего (только при улучшении)
 // ----------------------------------------------------------------------
-void find_and_update_global_best(const double* d_pbest_val, const double* d_X,
-                                 double* d_gbest_val, double* d_gbest_pos,
+bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
+                                 double* d_gbest_pos,
                                  int dim, int particles,
                                  double* d_block_vals, int* d_block_idxs,
                                  int grid_size, int block_size,
                                  double& host_gbest_val, std::vector<double>& host_gbest_pos)
 {
-    // Редукция по блокам
     block_reduce_min<<<grid_size, block_size, 2 * block_size * sizeof(double)>>>(
         d_pbest_val, particles, d_block_vals, d_block_idxs);
-
     std::vector<double> block_vals(grid_size);
     std::vector<int> block_idxs(grid_size);
     CUDA_CHECK(cudaMemcpy(block_vals.data(), d_block_vals, grid_size * sizeof(double), cudaMemcpyDeviceToHost));
@@ -289,33 +272,22 @@ void find_and_update_global_best(const double* d_pbest_val, const double* d_X,
 
     double min_val = block_vals[0];
     int best_idx = block_idxs[0];
-    for (int b = 1; b < grid_size; ++b) {
-        if (block_vals[b] < min_val) {
-            min_val = block_vals[b];
-            best_idx = block_idxs[b];
-        }
-    }
+    for (int b = 1; b < grid_size; ++b)
+        if (block_vals[b] < min_val) { min_val = block_vals[b]; best_idx = block_idxs[b]; }
 
     if (min_val < host_gbest_val) {
         host_gbest_val = min_val;
-        // В SoA‑раскладке позиция лучшей частицы разбросана по измерениям:
-        //   координата j хранится в d_X[j * particles + best_idx]
-        // Копируем её на хост (можно было бы оставить на устройстве, но для единообразия копируем)
-        std::vector<double> temp_pos(dim);
-        for (int j = 0; j < dim; ++j) {
-            CUDA_CHECK(cudaMemcpy(&temp_pos[j],
-                                  d_X + j * particles + best_idx,
+        for (int j = 0; j < dim; ++j)
+            CUDA_CHECK(cudaMemcpy(&host_gbest_pos[j], d_X + j * particles + best_idx,
                                   sizeof(double), cudaMemcpyDeviceToHost));
-        }
-        host_gbest_pos = temp_pos;
+        CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
+        return true;
     }
-
-    CUDA_CHECK(cudaMemcpy(d_gbest_val, &host_gbest_val, sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
+    return false;
 }
 
 // ----------------------------------------------------------------------
-// Основная процедура Boids‑PSO (глобальные средние, SoA‑раскладка)
+// Основная процедура Boids‑PSO (глобальные средние)
 // ----------------------------------------------------------------------
 void boids_pso_optimized(int dim, int particles, int iterations,
                          double w, double c1, double c2,
@@ -325,24 +297,19 @@ void boids_pso_optimized(int dim, int particles, int iterations,
                          std::vector<double>& history, unsigned int seed,
                          const std::string& func_name)
 {
-    // ---------- Выделение памяти ----------
-    // Все векторы частиц хранятся как [dim][particles]
     double *d_X, *d_V, *d_pbest_pos, *d_pbest_val;
     CUDA_CHECK(cudaMalloc(&d_X, dim * particles * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_V, dim * particles * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_pbest_pos, dim * particles * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_pbest_val, particles * sizeof(double)));
 
-    double *d_gbest_pos, *d_gbest_val;
+    double *d_gbest_pos;
     CUDA_CHECK(cudaMalloc(&d_gbest_pos, dim * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_gbest_val, sizeof(double)));
 
-    // Средние на устройстве
     double *d_mean_X, *d_mean_V;
     CUDA_CHECK(cudaMalloc(&d_mean_X, dim * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_mean_V, dim * sizeof(double)));
 
-    // Временные массивы для редукции минимума
     int block_size_min = 256;
     int grid_size_min = (particles + block_size_min - 1) / block_size_min;
     double *d_block_vals;
@@ -352,36 +319,35 @@ void boids_pso_optimized(int dim, int particles, int iterations,
 
     int func_id = static_cast<int>(get_func_id(func_name));
 
-    // ---------- Инициализация ----------
+    // Инициализация
     init_kernel<<<grid_size_min, block_size_min>>>(
         d_X, d_V, d_pbest_pos, d_pbest_val,
         dim, particles, lower, upper, seed, func_id);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Первичный выбор глобального лучшего
     double host_gbest_val = INFINITY;
     std::vector<double> host_gbest_pos(dim);
-    find_and_update_global_best(d_pbest_val, d_X,
-                                d_gbest_val, d_gbest_pos,
+    find_and_update_global_best(d_pbest_val, d_X, d_gbest_pos,
                                 dim, particles,
                                 d_block_vals, d_block_idxs,
                                 grid_size_min, block_size_min,
                                 host_gbest_val, host_gbest_pos);
 
-    // Параметры запуска для редукции средних (один блок на измерение)
-    int block_size_mean = 256;   // можно увеличить до 512/1024 при наличии ресурсов
-    // shared memory: 2 * block_size_mean * sizeof(double)
+    // Параметры для редукции средних
+    int block_size_mean = 256;
     int shared_mem_mean = 2 * block_size_mean * sizeof(double);
 
-    // ---------- Главный цикл ----------
+    // Shared memory для ядра обновления: 3 * dim * sizeof(double) (gbest, mean_X, mean_V)
+    int shared_mem_update = 3 * dim * sizeof(double);
+
     for (int t = 0; t < iterations; ++t) {
-        // 1. Вычисление глобальных средних X и V полностью на GPU
+        // 1. Глобальные средние
         reduce_mean_per_dim<<<dim, block_size_mean, shared_mem_mean>>>(
             d_X, d_V, dim, particles, d_mean_X, d_mean_V);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // 2. Обновление частиц
-        update_particles_global<<<grid_size_min, block_size_min>>>(
+        update_particles_global<<<grid_size_min, block_size_min, shared_mem_update>>>(
             d_X, d_V, d_pbest_pos, d_pbest_val,
             dim, particles, d_gbest_pos,
             d_mean_X, d_mean_V,
@@ -389,9 +355,8 @@ void boids_pso_optimized(int dim, int particles, int iterations,
             beta, gamma, seed + t + 1, func_id);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // 3. Поиск нового глобального лучшего
-        find_and_update_global_best(d_pbest_val, d_X,
-                                    d_gbest_val, d_gbest_pos,
+        // 3. Новый глобальный лучший
+        find_and_update_global_best(d_pbest_val, d_X, d_gbest_pos,
                                     dim, particles,
                                     d_block_vals, d_block_idxs,
                                     grid_size_min, block_size_min,
@@ -403,16 +368,13 @@ void boids_pso_optimized(int dim, int particles, int iterations,
     best_val = host_gbest_val;
     best_pos = host_gbest_pos;
 
-    // ---------- Очистка ----------
     CUDA_CHECK(cudaFree(d_X)); CUDA_CHECK(cudaFree(d_V));
     CUDA_CHECK(cudaFree(d_pbest_pos)); CUDA_CHECK(cudaFree(d_pbest_val));
-    CUDA_CHECK(cudaFree(d_gbest_pos)); CUDA_CHECK(cudaFree(d_gbest_val));
+    CUDA_CHECK(cudaFree(d_gbest_pos));
     CUDA_CHECK(cudaFree(d_mean_X)); CUDA_CHECK(cudaFree(d_mean_V));
     CUDA_CHECK(cudaFree(d_block_vals)); CUDA_CHECK(cudaFree(d_block_idxs));
 }
 
-// ----------------------------------------------------------------------
-// main
 // ----------------------------------------------------------------------
 int main(int argc, char** argv) {
     int dim = 30, particles = 500, iterations = 500, file = 0;
@@ -471,6 +433,5 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
 // Компиляция:
 // nvcc -O2 boids_pso_cuda_global.cu -o boids_pso_cuda_global.exe -lcurand

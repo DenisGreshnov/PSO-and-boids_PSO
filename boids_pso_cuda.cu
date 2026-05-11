@@ -1,9 +1,11 @@
 // boids_pso_cuda_optimized.cu
 // Версия с поиском соседей (Boids - O(N²·dim)).
 // Оптимизации:
-// - SoA‑раскладка (dim × particles) для X, V, pbest_pos.
-// - Динамическое выделение локальных массивов вместо фиксированных [2000].
-// - Коалесцированные/широковещательные обращения к глобальной памяти во всех циклах.
+// - SoA‑раскладка (dim × particles)
+// - Убран динамический new/delete: используются предварительно выделенные глобальные буферы d_sep, d_alg, d_coh
+// - gbest_pos копируется только при улучшении; d_gbest_val удалено
+// - Кэширование gbest_pos в shared-память в ядре (не показано, но можно; здесь оставлено прямое чтение из-за сложности с соседями)
+//   (Добавлен shared-кэш gbest для скорости)
 
 #include <cuda_runtime.h>
 #include <curand.h>
@@ -15,7 +17,13 @@
 #include <cstring>
 #include <cmath>
 #include <unordered_map>
-#include <corecrt_math_defines.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
 
 #define CUDA_CHECK(call)                                            \
     do {                                                            \
@@ -28,7 +36,7 @@
         }                                                           \
     } while (0)
 
-// ----------------------------------------------------------------------
+// Целевые функции (аналогично стандартному PSO)
 __device__ double rastrigin(const double* x, int dim, int particles, int idx) {
     double s = 10.0 * dim;
     for (int j = 0; j < dim; ++j) {
@@ -37,7 +45,6 @@ __device__ double rastrigin(const double* x, int dim, int particles, int idx) {
     }
     return s;
 }
-
 __device__ double rosenbrock(const double* x, int dim, int particles, int idx) {
     double s = 0.0;
     for (int j = 0; j < dim - 1; ++j) {
@@ -49,7 +56,6 @@ __device__ double rosenbrock(const double* x, int dim, int particles, int idx) {
     }
     return s;
 }
-
 __device__ double ackley(const double* x, int dim, int particles, int idx) {
     double sum1 = 0.0, sum2 = 0.0;
     for (int j = 0; j < dim; ++j) {
@@ -124,7 +130,7 @@ __global__ void init_kernel(double* X, double* V, double* pbest_pos, double* pbe
 }
 
 // ----------------------------------------------------------------------
-// Обновление с локальными соседями (SoA + динамические массивы)
+// Обновление с локальными соседями (используются глобальные буферы для sep/alg/coh)
 // ----------------------------------------------------------------------
 __global__ void update_boids_kernel(double* X, double* V,
                                     double* pbest_pos, double* pbest_val,
@@ -134,34 +140,41 @@ __global__ void update_boids_kernel(double* X, double* V,
                                     double w, double c1, double c2,
                                     double alpha, double beta, double gamma,
                                     double r_neigh,
-                                    unsigned int seed, int func_id)
+                                    unsigned int seed, int func_id,
+                                    double* d_sep, double* d_alg, double* d_coh)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particles) return;
 
+    // Кэшируем gbest_pos в разделяемую память
+    extern __shared__ double s_gbest[];
+    for (int t = threadIdx.x; t < dim; t += blockDim.x) {
+        s_gbest[t] = gbest_pos[t];
+    }
+    __syncthreads();
+
     curandStatePhilox4_32_10_t state;
     curand_init(seed, i, 0, &state);
 
-    // Выделяем локальные массивы для накопления Boids-сил
-    double* sep = new double[dim];
-    double* alg = new double[dim];
-    double* coh = new double[dim];
+    // Указатели на личные буферы текущей частицы
+    double* sep_i = d_sep + i * dim;
+    double* alg_i = d_alg + i * dim;
+    double* coh_i = d_coh + i * dim;
+
+    // Обнуляем накопления
     for (int j = 0; j < dim; ++j) {
-        sep[j] = 0.0;
-        alg[j] = 0.0;
-        coh[j] = 0.0;
+        sep_i[j] = 0.0;
+        alg_i[j] = 0.0;
+        coh_i[j] = 0.0;
     }
 
-    int neigh_count = 0;
     double r_neigh_sq = r_neigh * r_neigh;
-    double max_vel_coeff = 0.2;
-    double range = upper - lower;
+    int neigh_count = 0;
 
-    // Поиск соседей (полный перебор)
+    // Поиск соседей
     for (int k = 0; k < particles; ++k) {
         if (k == i) continue;
 
-        // Расстояние между i и k
         double dist_sq = 0.0;
         for (int j = 0; j < dim; ++j) {
             double diff = X[j * particles + i] - X[j * particles + k];
@@ -173,9 +186,9 @@ __global__ void update_boids_kernel(double* X, double* V,
             double inv_dist = rsqrt(dist_sq);
             for (int j = 0; j < dim; ++j) {
                 double diff_x = X[j * particles + i] - X[j * particles + k];
-                sep[j] += diff_x * inv_dist;
-                alg[j] += V[j * particles + k] - V[j * particles + i];
-                coh[j] += X[j * particles + k] - X[j * particles + i];
+                sep_i[j] += diff_x * inv_dist;
+                alg_i[j] += V[j * particles + k] - V[j * particles + i];
+                coh_i[j] += X[j * particles + k] - X[j * particles + i];
             }
         }
     }
@@ -184,13 +197,15 @@ __global__ void update_boids_kernel(double* X, double* V,
     if (neigh_count > 0) {
         double inv_n = 1.0 / neigh_count;
         for (int j = 0; j < dim; ++j) {
-            sep[j] *= inv_n;
-            alg[j] *= inv_n;
-            coh[j] *= inv_n;
+            sep_i[j] *= inv_n;
+            alg_i[j] *= inv_n;
+            coh_i[j] *= inv_n;
         }
     }
 
     // Обновление скорости и позиции
+    double max_vel_coeff = 0.2;
+    double range = upper - lower;
     for (int j = 0; j < dim; ++j) {
         double x_ij = X[j * particles + i];
         double v_ij = V[j * particles + i];
@@ -200,10 +215,10 @@ __global__ void update_boids_kernel(double* X, double* V,
 
         v_ij = w * v_ij
              + c1 * r1 * (p_ij - x_ij)
-             + c2 * r2 * (gbest_pos[j] - x_ij)
-             + alpha * sep[j]
-             + beta  * alg[j]
-             + gamma * coh[j];
+             + c2 * r2 * (s_gbest[j] - x_ij)
+             + alpha * sep_i[j]
+             + beta  * alg_i[j]
+             + gamma * coh_i[j];
 
         double max_vel = max_vel_coeff * range;
         v_ij = fmin(fmax(v_ij, -max_vel), max_vel);
@@ -216,17 +231,12 @@ __global__ void update_boids_kernel(double* X, double* V,
         V[j * particles + i] = v_ij;
     }
 
-    // Обновление персонального лучшего
     double new_val = compute_fitness(X, dim, particles, i, func_id);
     if (new_val < pbest_val[i]) {
         pbest_val[i] = new_val;
         for (int j = 0; j < dim; ++j)
             pbest_pos[j * particles + i] = X[j * particles + i];
     }
-
-    delete[] sep;
-    delete[] alg;
-    delete[] coh;
 }
 
 // ----------------------------------------------------------------------
@@ -261,10 +271,10 @@ __global__ void block_reduce(const double* pbest_val, int particles,
 }
 
 // ----------------------------------------------------------------------
-// Вспомогательная функция выбора глобального лучшего
+// Обновление глобального лучшего (только при улучшении)
 // ----------------------------------------------------------------------
-void find_and_update_global_best(const double* d_pbest_val, const double* d_X,
-                                 double* d_gbest_val, double* d_gbest_pos,
+bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
+                                 double* d_gbest_pos,
                                  int dim, int particles,
                                  double* d_block_vals, int* d_block_idxs,
                                  int grid_size, int block_size,
@@ -279,20 +289,18 @@ void find_and_update_global_best(const double* d_pbest_val, const double* d_X,
 
     double min_val = block_vals[0];
     int best_idx = block_idxs[0];
-    for (int b = 1; b < grid_size; ++b) {
-        if (block_vals[b] < min_val) {
-            min_val = block_vals[b];
-            best_idx = block_idxs[b];
-        }
-    }
+    for (int b = 1; b < grid_size; ++b)
+        if (block_vals[b] < min_val) { min_val = block_vals[b]; best_idx = block_idxs[b]; }
+
     if (min_val < host_gbest_val) {
         host_gbest_val = min_val;
         for (int j = 0; j < dim; ++j)
             CUDA_CHECK(cudaMemcpy(&host_gbest_pos[j], d_X + j * particles + best_idx,
                                   sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
+        return true;
     }
-    CUDA_CHECK(cudaMemcpy(d_gbest_val, &host_gbest_val, sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
+    return false;
 }
 
 // ----------------------------------------------------------------------
@@ -316,9 +324,14 @@ void boids_pso_cuda(int dim, int particles, int iterations,
     CUDA_CHECK(cudaMalloc(&d_pbest_pos, dim * particles * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_pbest_val, particles * sizeof(double)));
 
-    double *d_gbest_pos, *d_gbest_val;
+    double *d_gbest_pos;
     CUDA_CHECK(cudaMalloc(&d_gbest_pos, dim * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_gbest_val, sizeof(double)));
+
+    // Буферы для sep/alg/coh (каждый размером particles * dim)
+    double *d_sep, *d_alg, *d_coh;
+    CUDA_CHECK(cudaMalloc(&d_sep, particles * dim * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_alg, particles * dim * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_coh, particles * dim * sizeof(double)));
 
     int block_size = 256;
     int grid_size = (particles + block_size - 1) / block_size;
@@ -335,20 +348,25 @@ void boids_pso_cuda(int dim, int particles, int iterations,
 
     double host_gbest_val = INFINITY;
     std::vector<double> host_gbest_pos(dim);
-    find_and_update_global_best(d_pbest_val, d_X, d_gbest_val, d_gbest_pos,
+    find_and_update_global_best(d_pbest_val, d_X, d_gbest_pos,
                                 dim, particles, d_block_vals, d_block_idxs,
                                 grid_size, block_size, host_gbest_val, host_gbest_pos);
 
+    // Shared memory для gbest_pos в ядре обновления
+    int shared_mem_size = dim * sizeof(double);
+
     // Главный цикл
     for (int t = 0; t < iterations; ++t) {
-        update_boids_kernel<<<grid_size, block_size>>>(d_X, d_V, d_pbest_pos, d_pbest_val,
-                                                       dim, particles, d_gbest_pos,
-                                                       lower, upper,
-                                                       w, c1, c2, alpha, beta, gamma, r_neigh,
-                                                       seed + t + 1, func_id);
+        update_boids_kernel<<<grid_size, block_size, shared_mem_size>>>(
+            d_X, d_V, d_pbest_pos, d_pbest_val,
+            dim, particles, d_gbest_pos,
+            lower, upper,
+            w, c1, c2, alpha, beta, gamma, r_neigh,
+            seed + t + 1, func_id,
+            d_sep, d_alg, d_coh);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        find_and_update_global_best(d_pbest_val, d_X, d_gbest_val, d_gbest_pos,
+        find_and_update_global_best(d_pbest_val, d_X, d_gbest_pos,
                                     dim, particles, d_block_vals, d_block_idxs,
                                     grid_size, block_size, host_gbest_val, host_gbest_pos);
         history[t] = host_gbest_val;
@@ -359,7 +377,8 @@ void boids_pso_cuda(int dim, int particles, int iterations,
 
     CUDA_CHECK(cudaFree(d_X)); CUDA_CHECK(cudaFree(d_V));
     CUDA_CHECK(cudaFree(d_pbest_pos)); CUDA_CHECK(cudaFree(d_pbest_val));
-    CUDA_CHECK(cudaFree(d_gbest_pos)); CUDA_CHECK(cudaFree(d_gbest_val));
+    CUDA_CHECK(cudaFree(d_gbest_pos));
+    CUDA_CHECK(cudaFree(d_sep)); CUDA_CHECK(cudaFree(d_alg)); CUDA_CHECK(cudaFree(d_coh));
     CUDA_CHECK(cudaFree(d_block_vals)); CUDA_CHECK(cudaFree(d_block_idxs));
 }
 
@@ -414,6 +433,5 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
-
 // Компиляция:
 // nvcc -O2 boids_pso_cuda.cu -o boids_pso_cuda.exe -lcurand

@@ -1,6 +1,10 @@
 // pso_cuda_optimized.cu
 // Стандартный PSO с SoA‑раскладкой, коалесцированным доступом к памяти.
 // Полностью заменяет pso_cuda_bench.cu.
+// Оптимизации:
+// - Убран лишний массив d_gbest_val (не используется в ядрах).
+// - gbest_pos кэшируется в shared-память в ядре обновления.
+// - Копирование gbest_pos на устройство только при улучшении.
 
 #include <cuda_runtime.h>
 #include <curand.h>
@@ -12,7 +16,13 @@
 #include <cstring>
 #include <cmath>
 #include <unordered_map>
-#include <corecrt_math_defines.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
 
 #define CUDA_CHECK(call)                                            \
     do {                                                            \
@@ -104,7 +114,7 @@ __global__ void init_particles(double* X, double* V, double* pbest_pos, double* 
 }
 
 // ----------------------------------------------------------------------
-// Обновление частиц (стандартный PSO)
+// Обновление частиц (стандартный PSO) с кэшированием gbest_pos в shared
 // ----------------------------------------------------------------------
 __global__ void update_particles(double* X, double* V,
                                  double* pbest_pos, double* pbest_val,
@@ -116,6 +126,15 @@ __global__ void update_particles(double* X, double* V,
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particles) return;
+
+    // Кэширование gbest_pos в разделяемую память блока
+    extern __shared__ double s_gbest[];
+    // Загрузка gbest_pos параллельно нитями блока
+    for (int t = threadIdx.x; t < dim; t += blockDim.x) {
+        s_gbest[t] = gbest_pos[t];
+    }
+    __syncthreads();
+
     curandStatePhilox4_32_10_t state;
     curand_init(seed, i, 0, &state);
     double max_vel_coeff = 0.2;
@@ -128,7 +147,7 @@ __global__ void update_particles(double* X, double* V,
         double r1 = curand_uniform_double(&state);
         double r2 = curand_uniform_double(&state);
 
-        v_ij = w * v_ij + c1 * r1 * (p_ij - x_ij) + c2 * r2 * (gbest_pos[j] - x_ij);
+        v_ij = w * v_ij + c1 * r1 * (p_ij - x_ij) + c2 * r2 * (s_gbest[j] - x_ij);
 
         double max_vel = max_vel_coeff * range;
         v_ij = fmin(fmax(v_ij, -max_vel), max_vel);
@@ -181,8 +200,11 @@ __global__ void block_reduce(const double* pbest_val, int particles,
 }
 
 // ----------------------------------------------------------------------
-void find_and_update_global_best(const double* d_pbest_val, const double* d_X,
-                                 double* d_gbest_val, double* d_gbest_pos,
+// Функция обновления глобального лучшего (только при улучшении)
+// Возвращает true, если лучший обновился
+// ----------------------------------------------------------------------
+bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
+                                 double* d_gbest_pos,
                                  int dim, int particles,
                                  double* d_block_vals, int* d_block_idxs,
                                  int grid_size, int block_size,
@@ -202,12 +224,15 @@ void find_and_update_global_best(const double* d_pbest_val, const double* d_X,
 
     if (min_val < host_gbest_val) {
         host_gbest_val = min_val;
+        // Копируем новую лучшую позицию с устройства
         for (int j = 0; j < dim; ++j)
             CUDA_CHECK(cudaMemcpy(&host_gbest_pos[j], d_X + j * particles + best_idx,
                                   sizeof(double), cudaMemcpyDeviceToHost));
+        // Загружаем на устройство новый gbest_pos
+        CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
+        return true;
     }
-    CUDA_CHECK(cudaMemcpy(d_gbest_val, &host_gbest_val, sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
+    return false;
 }
 
 // ----------------------------------------------------------------------
@@ -224,9 +249,8 @@ void pso_cuda(int dim, int particles, int iterations,
     CUDA_CHECK(cudaMalloc(&d_pbest_pos, dim * particles * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_pbest_val, particles * sizeof(double)));
 
-    double *d_gbest_pos, *d_gbest_val;
+    double *d_gbest_pos;
     CUDA_CHECK(cudaMalloc(&d_gbest_pos, dim * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_gbest_val, sizeof(double)));
 
     int block_size = 256;
     int grid_size = (particles + block_size - 1) / block_size;
@@ -242,18 +266,23 @@ void pso_cuda(int dim, int particles, int iterations,
 
     double host_gbest_val = INFINITY;
     std::vector<double> host_gbest_pos(dim);
-    find_and_update_global_best(d_pbest_val, d_X, d_gbest_val, d_gbest_pos,
+    // Первичный поиск глобального лучшего
+    find_and_update_global_best(d_pbest_val, d_X, d_gbest_pos,
                                 dim, particles, d_block_vals, d_block_idxs,
                                 grid_size, block_size, host_gbest_val, host_gbest_pos);
 
+    // Размер shared memory для ядра update_particles: dim * sizeof(double)
+    int shared_mem_size = dim * sizeof(double);
+
     for (int t = 0; t < iterations; ++t) {
-        update_particles<<<grid_size, block_size>>>(d_X, d_V, d_pbest_pos, d_pbest_val,
-                                                    dim, particles, d_gbest_pos,
-                                                    lower, upper, w, c1, c2,
-                                                    seed + t + 1, func_id);
+        update_particles<<<grid_size, block_size, shared_mem_size>>>(
+            d_X, d_V, d_pbest_pos, d_pbest_val,
+            dim, particles, d_gbest_pos,
+            lower, upper, w, c1, c2,
+            seed + t + 1, func_id);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        find_and_update_global_best(d_pbest_val, d_X, d_gbest_val, d_gbest_pos,
+        find_and_update_global_best(d_pbest_val, d_X, d_gbest_pos,
                                     dim, particles, d_block_vals, d_block_idxs,
                                     grid_size, block_size, host_gbest_val, host_gbest_pos);
         history[t] = host_gbest_val;
@@ -264,7 +293,7 @@ void pso_cuda(int dim, int particles, int iterations,
 
     CUDA_CHECK(cudaFree(d_X)); CUDA_CHECK(cudaFree(d_V));
     CUDA_CHECK(cudaFree(d_pbest_pos)); CUDA_CHECK(cudaFree(d_pbest_val));
-    CUDA_CHECK(cudaFree(d_gbest_pos)); CUDA_CHECK(cudaFree(d_gbest_val));
+    CUDA_CHECK(cudaFree(d_gbest_pos));
     CUDA_CHECK(cudaFree(d_block_vals)); CUDA_CHECK(cudaFree(d_block_idxs));
 }
 
@@ -313,6 +342,5 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
-
 // Компиляция:
 // nvcc -O2 pso_cuda_bench.cu -o pso_cuda_bench.exe -lcurand
