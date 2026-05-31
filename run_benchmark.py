@@ -32,24 +32,24 @@ PROGRAMS = [
 ]
 
 # Параметры для разных типов
-PARTICLES_FAST = [100, 500, 1000, 5000, 50000]
-ITER_FAST = [300]
+PARTICLES_FAST = [50, 100, 500, 1000, 5000, 100000]
+ITER_FAST = [200]
 
-PARTICLES_SLOW = [50, 100, 500, 1000]   # чтобы не ждать часами
+PARTICLES_SLOW = [50, 100, 500, 1000, 5000]
 ITER_SLOW = [200]
 
 PARTICLES_VERY_SLOW = [50, 100]
 ITER_VERY_SLOW = [200]
 
 # Для boids-версий, которые принимают alpha/beta/gamma
-ALPHA_VALUES = [0.02, 0.07, 0.2]
-BETA_VALUES  = [0.01, 0.05, 0.1]
-GAMMA_VALUES = [0.01, 0.05, 0.1]
+ALPHA_VALUES = [0.2]
+BETA_VALUES  = [0.1]
+GAMMA_VALUES = [0.1]
 #RNEIGH_VALUES = [2.0, 5.0]    # если нужен (для медленных)
 
 # Для global-версий, которые не принимают alpha, но имеют beta/gamma
-BETA_GLOBAL_VALUES = [0.01, 0.02, 0.05, 0.1]
-GAMMA_GLOBAL_VALUES = [0.01, 0.02, 0.05, 0.1]
+BETA_GLOBAL_VALUES = [0.01, 0.05, 0.1, 0.2]
+GAMMA_GLOBAL_VALUES = [0.01, 0.05, 0.1, 0.2]
 
 # ----------------------------------------------------------------------
 #  Функция запуска и извлечения результатов
@@ -140,10 +140,6 @@ for prog in PROGRAMS:
         args += ["-iter", str(params_dict["iter"])]
         args += ["-seed", str(params_dict["seed"])]
 
-        # Границы для разных функций (можно задать автоматически, но для простоты используем -lb/-ub,
-        # хотя программы могут иметь значения по умолчанию, но лучше явно указать)
-        # Для rosenbrock лучше использовать -2.048 2.048, для ackley -32.768 32.768, для rastrigin -5.12 5.12.
-        # Будем задавать явно, чтобы избежать сюрпризов.
         func = params_dict["func"]
         if func == "rosenbrock":
             args += ["-lb", "-2.048", "-ub", "2.048"]

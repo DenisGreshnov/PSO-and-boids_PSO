@@ -1,12 +1,3 @@
-// boids_pso_cuda_optimized.cu
-// Версия с поиском соседей (Boids - O(N²·dim)).
-// Оптимизации:
-// - SoA‑раскладка (dim × particles)
-// - Убран динамический new/delete: используются предварительно выделенные глобальные буферы d_sep, d_alg, d_coh
-// - gbest_pos копируется только при улучшении; d_gbest_val удалено
-// - Кэширование gbest_pos в shared-память в ядре (не показано, но можно; здесь оставлено прямое чтение из-за сложности с соседями)
-//   (Добавлен shared-кэш gbest для скорости)
-
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <curand_kernel.h>
@@ -24,17 +15,6 @@
 #ifndef M_E
 #define M_E 2.71828182845904523536
 #endif
-
-#define CUDA_CHECK(call)                                            \
-    do {                                                            \
-        cudaError_t err = call;                                     \
-        if (err != cudaSuccess) {                                  \
-            std::cerr << "CUDA error at " << __FILE__ << ":"       \
-                      << __LINE__ << " - " << cudaGetErrorString(err) \
-                      << " (" << #call << ")" << std::endl;       \
-            exit(EXIT_FAILURE);                                    \
-        }                                                           \
-    } while (0)
 
 // Целевые функции (аналогично стандартному PSO)
 __device__ double rastrigin(const double* x, int dim, int particles, int idx) {
@@ -240,7 +220,7 @@ __global__ void update_boids_kernel(double* X, double* V,
 }
 
 // ----------------------------------------------------------------------
-// Редукция минимума (как в исходной)
+// Редукция минимума
 // ----------------------------------------------------------------------
 __global__ void block_reduce(const double* pbest_val, int particles,
                              double* d_block_vals, int* d_block_idxs)
@@ -271,7 +251,7 @@ __global__ void block_reduce(const double* pbest_val, int particles,
 }
 
 // ----------------------------------------------------------------------
-// Обновление глобального лучшего (только при улучшении)
+// Обновление глобального лучшего
 // ----------------------------------------------------------------------
 bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
                                  double* d_gbest_pos,
@@ -284,8 +264,8 @@ bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
         d_pbest_val, particles, d_block_vals, d_block_idxs);
     std::vector<double> block_vals(grid_size);
     std::vector<int> block_idxs(grid_size);
-    CUDA_CHECK(cudaMemcpy(block_vals.data(), d_block_vals, grid_size * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(block_idxs.data(), d_block_idxs, grid_size * sizeof(int), cudaMemcpyDeviceToHost));
+    cudaMemcpy(block_vals.data(), d_block_vals, grid_size * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(block_idxs.data(), d_block_idxs, grid_size * sizeof(int), cudaMemcpyDeviceToHost);
 
     double min_val = block_vals[0];
     int best_idx = block_idxs[0];
@@ -295,9 +275,9 @@ bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
     if (min_val < host_gbest_val) {
         host_gbest_val = min_val;
         for (int j = 0; j < dim; ++j)
-            CUDA_CHECK(cudaMemcpy(&host_gbest_pos[j], d_X + j * particles + best_idx,
-                                  sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
+            cudaMemcpy(&host_gbest_pos[j], d_X + j * particles + best_idx,
+                                  sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
         return true;
     }
     return false;
@@ -319,32 +299,32 @@ void boids_pso_cuda(int dim, int particles, int iterations,
 
     // Выделение памяти (SoA)
     double *d_X, *d_V, *d_pbest_pos, *d_pbest_val;
-    CUDA_CHECK(cudaMalloc(&d_X, dim * particles * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_V, dim * particles * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_pbest_pos, dim * particles * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_pbest_val, particles * sizeof(double)));
+    cudaMalloc(&d_X, dim * particles * sizeof(double));
+    cudaMalloc(&d_V, dim * particles * sizeof(double));
+    cudaMalloc(&d_pbest_pos, dim * particles * sizeof(double));
+    cudaMalloc(&d_pbest_val, particles * sizeof(double));
 
     double *d_gbest_pos;
-    CUDA_CHECK(cudaMalloc(&d_gbest_pos, dim * sizeof(double)));
+    cudaMalloc(&d_gbest_pos, dim * sizeof(double));
 
     // Буферы для sep/alg/coh (каждый размером particles * dim)
     double *d_sep, *d_alg, *d_coh;
-    CUDA_CHECK(cudaMalloc(&d_sep, particles * dim * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_alg, particles * dim * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_coh, particles * dim * sizeof(double)));
+    cudaMalloc(&d_sep, particles * dim * sizeof(double));
+    cudaMalloc(&d_alg, particles * dim * sizeof(double));
+    cudaMalloc(&d_coh, particles * dim * sizeof(double));
 
     int block_size = 256;
     int grid_size = (particles + block_size - 1) / block_size;
     double *d_block_vals; int *d_block_idxs;
-    CUDA_CHECK(cudaMalloc(&d_block_vals, grid_size * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_block_idxs, grid_size * sizeof(int)));
+    cudaMalloc(&d_block_vals, grid_size * sizeof(double));
+    cudaMalloc(&d_block_idxs, grid_size * sizeof(int));
 
     int func_id = static_cast<int>(get_func_id(func_name));
 
     // Инициализация
     init_kernel<<<grid_size, block_size>>>(d_X, d_V, d_pbest_pos, d_pbest_val,
                                            dim, particles, lower, upper, seed, func_id);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaDeviceSynchronize();
 
     double host_gbest_val = INFINITY;
     std::vector<double> host_gbest_pos(dim);
@@ -364,7 +344,7 @@ void boids_pso_cuda(int dim, int particles, int iterations,
             w, c1, c2, alpha, beta, gamma, r_neigh,
             seed + t + 1, func_id,
             d_sep, d_alg, d_coh);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaDeviceSynchronize();
 
         find_and_update_global_best(d_pbest_val, d_X, d_gbest_pos,
                                     dim, particles, d_block_vals, d_block_idxs,
@@ -375,11 +355,11 @@ void boids_pso_cuda(int dim, int particles, int iterations,
     best_val = host_gbest_val;
     best_pos = host_gbest_pos;
 
-    CUDA_CHECK(cudaFree(d_X)); CUDA_CHECK(cudaFree(d_V));
-    CUDA_CHECK(cudaFree(d_pbest_pos)); CUDA_CHECK(cudaFree(d_pbest_val));
-    CUDA_CHECK(cudaFree(d_gbest_pos));
-    CUDA_CHECK(cudaFree(d_sep)); CUDA_CHECK(cudaFree(d_alg)); CUDA_CHECK(cudaFree(d_coh));
-    CUDA_CHECK(cudaFree(d_block_vals)); CUDA_CHECK(cudaFree(d_block_idxs));
+    cudaFree(d_X); cudaFree(d_V);
+    cudaFree(d_pbest_pos); cudaFree(d_pbest_val);
+    cudaFree(d_gbest_pos);
+    cudaFree(d_sep); cudaFree(d_alg); cudaFree(d_coh);
+    cudaFree(d_block_vals); cudaFree(d_block_idxs);
 }
 
 // ----------------------------------------------------------------------

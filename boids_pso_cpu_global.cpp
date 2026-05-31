@@ -166,7 +166,6 @@ int main(int argc, char** argv) {
     std::string func = "rastrigin";
     double lb = INFINITY, ub = INFINITY;
 
-    // r_neigh больше не используется, оставим для обратной совместимости
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-dim") == 0 && i+1 < argc) dim = atoi(argv[++i]);
         else if (strcmp(argv[i], "-particles") == 0 && i+1 < argc) particles = atoi(argv[++i]);
@@ -182,13 +181,9 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-lb") == 0 && i+1 < argc) lb = atof(argv[++i]);
         else if (strcmp(argv[i], "-ub") == 0 && i+1 < argc) ub = atof(argv[++i]);
         else if (strcmp(argv[i], "-file") == 0 && i+1 < argc) file = atoi(argv[++i]);
-        // -r_neigh игнорируется
     }
     if (lb == INFINITY) lb = func_bounds[func].lb;
     if (ub == INFINITY) ub = func_bounds[func].ub;
-
-    std::cout << "Boids-PSO with global means (CPU, dim=" << dim
-              << ", particles=" << particles << ", iter=" << iterations << ")\n";
 
     std::vector<double> lower(dim, lb), upper(dim, ub);
     std::vector<double> best_pos(dim);

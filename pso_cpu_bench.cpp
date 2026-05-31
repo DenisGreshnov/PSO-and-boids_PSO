@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
     std::string func_name = "rastrigin";
     double lower_bound = INFINITY, upper_bound = INFINITY;
 
-    // Простой парсинг аргументов (можно заменить на getopt)
+    // парсинг аргументов
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-dim") == 0 && i+1 < argc) dim = atoi(argv[++i]);
         else if (strcmp(argv[i], "-particles") == 0 && i+1 < argc) particles = atoi(argv[++i]);

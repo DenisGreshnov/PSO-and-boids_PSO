@@ -1,12 +1,3 @@
-// boids_pso_cuda_global_optimized.cu
-// Оптимизированная версия Boids‑PSO с глобальными средними (O(N·dim)).
-// Оптимизации:
-// 1. SoA‑раскладка.
-// 2. Средние вычисляются полностью на GPU, без копирования на хост.
-// 3. d_gbest_val устранено, gbest_pos копируется только при улучшении.
-// 4. Кэширование gbest_pos и mean_X, mean_V в shared-память в ядре обновления (где возможно).
-// 5. Убран <corecrt_math_defines.h>, константы определены.
-
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <curand_kernel.h>
@@ -24,17 +15,6 @@
 #ifndef M_E
 #define M_E 2.71828182845904523536
 #endif
-
-#define CUDA_CHECK(call)                                            \
-    do {                                                            \
-        cudaError_t err = call;                                     \
-        if (err != cudaSuccess) {                                  \
-            std::cerr << "CUDA error at " << __FILE__ << ":"       \
-                      << __LINE__ << " - " << cudaGetErrorString(err) \
-                      << " (" << #call << ")" << std::endl;       \
-            exit(EXIT_FAILURE);                                    \
-        }                                                           \
-    } while (0)
 
 // Целевые функции
 __device__ double rastrigin(const double* x, int dim, int particles, int idx) {
@@ -101,7 +81,7 @@ __global__ void init_kernel(double* X, double* V, double* pbest_pos, double* pbe
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particles) return;
     curandStatePhilox4_32_10_t state;
-    curand_init(seed, i, 0, &state);
+    curand_init((unsigned long long)seed, (unsigned long long)i, 0, &state);
     double range = upper - lower;
     for (int j = 0; j < dim; ++j) {
         double x_val = lower + curand_uniform_double(&state) * range;
@@ -178,7 +158,7 @@ __global__ void update_particles_global(double* X, double* V,
     __syncthreads();
 
     curandStatePhilox4_32_10_t state;
-    curand_init(seed, i, 0, &state);
+    curand_init((unsigned long long)seed, (unsigned long long)i, 0, &state);
     double range = upper - lower;
     double max_vel_coeff = 0.2;
 
@@ -254,7 +234,7 @@ __global__ void block_reduce_min(const double* pbest_val, int particles,
 }
 
 // ----------------------------------------------------------------------
-// Поиск и обновление глобального лучшего (только при улучшении)
+// Поиск и обновление глобального лучшего
 // ----------------------------------------------------------------------
 bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
                                  double* d_gbest_pos,
@@ -267,8 +247,8 @@ bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
         d_pbest_val, particles, d_block_vals, d_block_idxs);
     std::vector<double> block_vals(grid_size);
     std::vector<int> block_idxs(grid_size);
-    CUDA_CHECK(cudaMemcpy(block_vals.data(), d_block_vals, grid_size * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(block_idxs.data(), d_block_idxs, grid_size * sizeof(int), cudaMemcpyDeviceToHost));
+    cudaMemcpy(block_vals.data(), d_block_vals, grid_size * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(block_idxs.data(), d_block_idxs, grid_size * sizeof(int), cudaMemcpyDeviceToHost);
 
     double min_val = block_vals[0];
     int best_idx = block_idxs[0];
@@ -278,9 +258,9 @@ bool find_and_update_global_best(const double* d_pbest_val, const double* d_X,
     if (min_val < host_gbest_val) {
         host_gbest_val = min_val;
         for (int j = 0; j < dim; ++j)
-            CUDA_CHECK(cudaMemcpy(&host_gbest_pos[j], d_X + j * particles + best_idx,
-                                  sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice));
+            cudaMemcpy(&host_gbest_pos[j], d_X + j * particles + best_idx,
+                                  sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(d_gbest_pos, host_gbest_pos.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
         return true;
     }
     return false;
@@ -298,24 +278,24 @@ void boids_pso_optimized(int dim, int particles, int iterations,
                          const std::string& func_name)
 {
     double *d_X, *d_V, *d_pbest_pos, *d_pbest_val;
-    CUDA_CHECK(cudaMalloc(&d_X, dim * particles * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_V, dim * particles * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_pbest_pos, dim * particles * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_pbest_val, particles * sizeof(double)));
+    cudaMalloc(&d_X, dim * particles * sizeof(double));
+    cudaMalloc(&d_V, dim * particles * sizeof(double));
+    cudaMalloc(&d_pbest_pos, dim * particles * sizeof(double));
+    cudaMalloc(&d_pbest_val, particles * sizeof(double));
 
     double *d_gbest_pos;
-    CUDA_CHECK(cudaMalloc(&d_gbest_pos, dim * sizeof(double)));
+    cudaMalloc(&d_gbest_pos, dim * sizeof(double));
 
     double *d_mean_X, *d_mean_V;
-    CUDA_CHECK(cudaMalloc(&d_mean_X, dim * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_mean_V, dim * sizeof(double)));
+    cudaMalloc(&d_mean_X, dim * sizeof(double));
+    cudaMalloc(&d_mean_V, dim * sizeof(double));
 
     int block_size_min = 256;
     int grid_size_min = (particles + block_size_min - 1) / block_size_min;
     double *d_block_vals;
     int *d_block_idxs;
-    CUDA_CHECK(cudaMalloc(&d_block_vals, grid_size_min * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_block_idxs, grid_size_min * sizeof(int)));
+    cudaMalloc(&d_block_vals, grid_size_min * sizeof(double));
+    cudaMalloc(&d_block_idxs, grid_size_min * sizeof(int));
 
     int func_id = static_cast<int>(get_func_id(func_name));
 
@@ -323,7 +303,7 @@ void boids_pso_optimized(int dim, int particles, int iterations,
     init_kernel<<<grid_size_min, block_size_min>>>(
         d_X, d_V, d_pbest_pos, d_pbest_val,
         dim, particles, lower, upper, seed, func_id);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaDeviceSynchronize();
 
     double host_gbest_val = INFINITY;
     std::vector<double> host_gbest_pos(dim);
@@ -344,7 +324,7 @@ void boids_pso_optimized(int dim, int particles, int iterations,
         // 1. Глобальные средние
         reduce_mean_per_dim<<<dim, block_size_mean, shared_mem_mean>>>(
             d_X, d_V, dim, particles, d_mean_X, d_mean_V);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaDeviceSynchronize();
 
         // 2. Обновление частиц
         update_particles_global<<<grid_size_min, block_size_min, shared_mem_update>>>(
@@ -352,8 +332,8 @@ void boids_pso_optimized(int dim, int particles, int iterations,
             dim, particles, d_gbest_pos,
             d_mean_X, d_mean_V,
             lower, upper, w, c1, c2,
-            beta, gamma, seed + t + 1, func_id);
-        CUDA_CHECK(cudaDeviceSynchronize());
+            beta, gamma, (unsigned long long)seed + t + 1, func_id);
+        cudaDeviceSynchronize();
 
         // 3. Новый глобальный лучший
         find_and_update_global_best(d_pbest_val, d_X, d_gbest_pos,
@@ -368,11 +348,11 @@ void boids_pso_optimized(int dim, int particles, int iterations,
     best_val = host_gbest_val;
     best_pos = host_gbest_pos;
 
-    CUDA_CHECK(cudaFree(d_X)); CUDA_CHECK(cudaFree(d_V));
-    CUDA_CHECK(cudaFree(d_pbest_pos)); CUDA_CHECK(cudaFree(d_pbest_val));
-    CUDA_CHECK(cudaFree(d_gbest_pos));
-    CUDA_CHECK(cudaFree(d_mean_X)); CUDA_CHECK(cudaFree(d_mean_V));
-    CUDA_CHECK(cudaFree(d_block_vals)); CUDA_CHECK(cudaFree(d_block_idxs));
+    cudaFree(d_X); cudaFree(d_V);
+    cudaFree(d_pbest_pos); cudaFree(d_pbest_val);
+    cudaFree(d_gbest_pos);
+    cudaFree(d_mean_X); cudaFree(d_mean_V);
+    cudaFree(d_block_vals); cudaFree(d_block_idxs);
 }
 
 // ----------------------------------------------------------------------
@@ -401,9 +381,6 @@ int main(int argc, char** argv) {
     }
     if (lb == INFINITY) lb = func_bounds[func].lb;
     if (ub == INFINITY) ub = func_bounds[func].ub;
-
-    std::cout << "Optimized Boids-PSO (SoA, dim=" << dim
-              << ", particles=" << particles << ", iter=" << iterations << ")\n";
 
     std::vector<double> best_pos(dim);
     double best_val;
